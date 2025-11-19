@@ -11,6 +11,11 @@ import torch.nn.functional as F
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
 
+# Some Command Line Arguments you can use
+# python -m venv .venv
+# python pico_llm.py --block_size 32 --tinystories_weight 0.0 --input_files 3seqs.txt --prompt "0 1 2 3 4" --device_id cuda:0
+# python pico_llm.py --block_size 32 --tinystories_weight 1.0 --input_files 3seqs.txt --prompt "Once upon a time" --device_id cuda:0
+
 from datasets import load_dataset
 import tiktoken
 
@@ -161,8 +166,36 @@ class KGramMLPSeqModel(nn.Module):
         self.chunk_size = chunk_size
 
         # fill in
+        #############################################
+        #############################################
 
-        self.net = None
+        # calculate the Input Dimensions and Vector Size. In this kGram part, we're NOT using nn.Embedding.
+        # we're instead doing this the dumb way, where we use a Sparse Matrix of size k* vocabsize (which is a massive overhead)
+        # Also add Hidden Dimensions, and Number of Inner Layers
+        input_dim = self.k * self.vocab_size
+        hidden_dim = self.embed_size
+        output_dim = self.vocab_size
+
+        # Start making the layers, Make Linear Layers the size and depth of the input/hidden_dim
+        # below is the "input layer"
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU()) # Or nn.SiLU()
+
+        # Add the specified number of hidden inner layers
+        # This makes the Neural net "Deep". However the default is literally "1"!
+        for _ in range(num_inner_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU()) # Or nn.SiLU()
+
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        
+        # The forward() loop will call this!
+        self.net = nn.Sequential(*layers)
+        
+        #############################################
+        #############################################
 
     def forward(self, tokens_seq):
         """
@@ -203,6 +236,16 @@ class KGramMLPSeqModel(nn.Module):
         return outputs
 
 
+'''
+    Notes: Upon some research, I realized that this above model is an ancient "failed" attempt at training a next token predictor.
+    Basically, since we flatten the vector with vocabulary size of 50k, and then also add a hidden layer of size 50k*1024
+    (or whatever thw batch size is) we see that for each token, the GPU (I have it enabled) performs a matrix multiplication of size 150Million!
+    That is not only computationally expensive, it is practically infeasible for most applications.
+    In fact LSTMs performed better because it's forward method didn't have hard coded loops which uses CPU
+    Bottom Line: We understand that the assignment is trying to help us learn that K-Gram is computationally infeasible!
+    Note: We will run this and LSTMs in front of graders and show them the difference in performance.
+'''
+
 ################################################################################
 # 4. LSTM-based seq2seq
 ################################################################################
@@ -236,15 +279,185 @@ class LSTMSeqModel(nn.Module):
 ################################################################################
 
 class RMSNorm(nn.Module):
+    """
+    Implements Root Mean Square Layer Normalization (RMSNorm).
+    
+    A simpler and faster alternative to LayerNorm that only
+    scales the input, without centering it (no mean subtraction).
+    """
     def __init__(self, dim, eps=1e-5):
         super().__init__()
-        pass
+        
+        # gain, initialized to all "1"s
+        self.gain = nn.Parameter(torch.ones(dim))
+        
+        # Epsolpn to prevent div by zero
+        self.eps = eps
 
-class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def forward(self, x):
+        # Calculate the RMS of the input - We compute 1.0 / sqrt(mean(x^2) + eps)
+        rms_dev = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        
+        # Normalize and apply gain
+        return x * rms_dev * self.gain
+    
+# Note: RMSNorm is the simpler alternative to LayerNorm or BatchNorm.
+# It just has a single "gain" factor and doesn't try to zero-center the mean!
+
+################################################################
+####            Transformer Architecture                    ####
+################################################################
+
+# First we write an "Attention" Mechanism, and call it the Multi Head Attention, where we will combine many single Self Attention Layers 
+class MultiHeadAttention(nn.Module):
+    """
+    Implementation of Causal Multi-Head Self-Attention (part of Task 4c).
+    
+    This is the "communication" layer. It lets tokens "look at"
+    and gather information from previous tokens.
+    """
+    def __init__(self, d_model, n_heads):
         super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        # Linear layers to project input into Q, K, V
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        
+        # Final output projection
+        self.out_proj = nn.Linear(d_model, d_model)
 
-        pass
+    def forward(self, x):
+        # Input
+        seq_len, batch_size, d_model = x.shape
+        
+        # Project to Q, K, V, and Split it
+        qkv = self.qkv_proj(x) # (seq_len, batch, 3 * d_model)
+        q, k, v = qkv.chunk(3, dim=-1) # Each is (seq_len, batch, d_model)
+        
+        # Reshape and transpose for multi-head
+        q = q.view(seq_len, batch_size, self.n_heads, self.head_dim).transpose(0, 1).transpose(1, 2)
+        k = k.view(seq_len, batch_size, self.n_heads, self.head_dim).transpose(0, 1).transpose(1, 2)
+        v = v.view(seq_len, batch_size, self.n_heads, self.head_dim).transpose(0, 1).transpose(1, 2)
+
+        # (B, nH, T, H) @ (B, nH, H, T) -> (B, nH, T, T)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # This code prevents the model from "cheating" by looking at future tokens, also called causal Look-Ahead Mask
+        T = seq_len
+        # torch.triu creates an upper-triangular matrix
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(mask, -float('inf'))
+        
+        # Softmax
+        attn_weights = F.softmax(scores, dim=-1)
+        
+        # (B, nH, T, T) @ (B, nH, T, H) -> (B, nH, T, H)
+        context = attn_weights @ v
+        
+        # (B, nH, T, H) -> (B, T, nH, H) -> (B, T, d_model)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        context = context.transpose(0, 1)
+
+        return self.out_proj(context)
+
+# Following is a single Transformer Head, which we will combine as a "block" in the main model
+class TransformerBlock(nn.Module):
+    """
+    A single Transformer Block.
+    
+    This is the "thinking" unit, combining communication (attention)
+    and computation (MLP) with normalization and residual connections.
+    """
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        
+        # First sub-layer: Causal Multi-Head Attention
+        self.norm1 = RMSNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, n_heads)
+        
+        # Second sub-layer: Feed-Forward Network (MLP)
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), # Standard 4x expansion
+            nn.SiLU(), # Choice: Use ReLU vs Swish like a choice variable
+            nn.Linear(d_model * 4, d_model)
+        )
+
+    def forward(self, x):
+        # x shape: (seq_len, batch, d_model)
+        # We have used a Pre-Normalization architecture (like GPT-2 and Llama)
+        
+        # Attention Sub-layer, which also has the residual connection
+        # (x = x + Sum(f(x_j)))
+        x = x + self.attn(self.norm1(x))
+        # z = z + g(z)
+        x = x + self.mlp(self.norm2(x))
+        
+        return x
+
+# Finally, we assemble multiple Transformer blocks
+class TransformerModel(nn.Module):
+    """
+    A full Causal Decoder-Only Transformer Achitecture.
+    """
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size=32):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_blocks = n_blocks
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        
+        # Token Embedding Layer
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Positional Embedding Layer
+        # We need a vector for each position from 0 to block_size-1
+        self.pos_embedding = nn.Embedding(block_size, d_model)
+        
+        # (c) A stack of Transformer Blocks
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model, n_heads) for _ in range(n_blocks)]
+        )
+        
+        # (c) Final normalization (Llama-style)
+        self.final_norm = RMSNorm(d_model)
+        
+        # (d) Final "unembedding" layer to get logits
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, tokens_seq):
+        # tokens_seq: (seq_len, batch)
+        seq_len, batch_size = tokens_seq.shape
+        
+        if seq_len > self.block_size:
+            raise ValueError(f"Sequence length {seq_len} exceeds model's block size {self.block_size}")
+        
+        # Get token embeddings
+        tok_emb = self.token_embedding(tokens_seq) # (seq_len, batch, d_model)
+        
+        # Get positional embeddings
+        # Create position IDs: [0, 1, 2, ..., seq_len-1]
+        # Then add them all together
+        pos = torch.arange(0, seq_len, dtype=torch.long, device=tokens_seq.device).unsqueeze(1) # (seq_len, 1)
+        pos_emb = self.pos_embedding(pos) # (seq_len, 1, d_model)
+
+        x = tok_emb + pos_emb
+        
+        # Run through all Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        # Apply final normalization
+        x = self.final_norm(x)
+        
+        # Apply unembedding layer to get logits
+        logits = self.lm_head(x) # (seq_len, batch, vocab_size)
+        
+        return logits
 
 
 ################################################################################
