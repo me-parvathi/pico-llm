@@ -392,10 +392,14 @@ class TransformerBlock(nn.Module):
         
         # Attention Sub-layer, which also has the residual connection
         # (x = x + Sum(f(x_j)))
-        x = x + self.attn(self.norm1(x))
+        # x = x + self.attn(self.norm1(x))
         # z = z + g(z)
-        x = x + self.mlp(self.norm2(x))
+        # x = x + self.mlp(self.norm2(x))
+        x = x + self.attn(x)  
         
+        x = x + self.mlp(x)   
+        
+        x = self.final_norm(x)  
         return x
 
 # Finally, we assemble multiple Transformer blocks
@@ -771,9 +775,10 @@ def main():
     ).to(device)
 
     models = {
-      # "kgram_mlp_seq": kgram_model,
-        "lstm_seq": lstm_model,
-      # "kvcache_transformer": kv_transformer,
+    #   "kgram_mlp_seq": kgram_model,
+      "lstm_seq": lstm_model,
+       "transformer": transformer
+    #   "kvcache_transformer": kv_transformer,
     }
 
 
