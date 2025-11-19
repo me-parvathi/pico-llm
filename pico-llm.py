@@ -385,6 +385,7 @@ class TransformerBlock(nn.Module):
             nn.SiLU(), # Choice: Use ReLU vs Swish like a choice variable
             nn.Linear(d_model * 4, d_model)
         )
+        self.final_norm = RMSNorm(d_model)
 
     def forward(self, x):
         # x shape: (seq_len, batch, d_model)
@@ -573,7 +574,8 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    batch_losses=None):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
@@ -598,6 +600,9 @@ def train_one_model(model,
 
             logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
             loss = compute_next_token_loss(logits, batch_tokens)
+
+            if batch_losses is not None:
+                batch_losses[model_name].append(loss.item())
 
             optimizer.zero_grad()
             loss.backward()
@@ -781,6 +786,7 @@ def main():
     #   "kvcache_transformer": kv_transformer,
     }
 
+    batch_losses = {model_name: [] for model_name in models}
 
     ############################################################################
     # Train each model
@@ -798,7 +804,8 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            batch_losses=batch_losses
         )
 
         # Final generation from the user-provided prompt (args.prompt).
@@ -831,6 +838,9 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+
+    from plots import plot_batch_losses
+    plot_batch_losses(batch_losses, save_path="batch_loss.png")
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
