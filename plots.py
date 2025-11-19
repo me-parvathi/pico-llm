@@ -102,3 +102,19 @@ def plot_nucleus_distribution(sorted_probs, p=0.95, top_k=50, save_path=None):
     
     plt.close()
 
+
+def plot_attention_heatmap(attn_matrix, save_path=None):
+    """
+    attn_matrix: numpy array [seq_len, seq_len] for a single head.
+    """
+    plt.figure()
+    im = plt.imshow(attn_matrix, cmap="viridis")
+    plt.xlabel("Key positions")
+    plt.ylabel("Query positions")
+    plt.colorbar(im, label="Attention weight")
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    
+    plt.close()
+

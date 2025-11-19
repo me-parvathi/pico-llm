@@ -332,7 +332,7 @@ class MultiHeadAttention(nn.Module):
         # Final output projection
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         # Input
         seq_len, batch_size, d_model = x.shape
         
@@ -364,7 +364,12 @@ class MultiHeadAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         context = context.transpose(0, 1)
 
-        return self.out_proj(context)
+        output = self.out_proj(context)
+        
+        if return_attn:
+            return output, attn_weights
+        else:
+            return output
 
 # Following is a single Transformer Head, which we will combine as a "block" in the main model
 class TransformerBlock(nn.Module):
@@ -390,7 +395,7 @@ class TransformerBlock(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         # x shape: (seq_len, batch, d_model)
         # We have used a Pre-Normalization architecture (like GPT-2 and Llama)
         
@@ -399,12 +404,21 @@ class TransformerBlock(nn.Module):
         # x = x + self.attn(self.norm1(x))
         # z = z + g(z)
         # x = x + self.mlp(self.norm2(x))
-        x = x + self.attn(x)  
+        attn_output = self.attn(x, return_attn=return_attn)
+        if return_attn:
+            attn_out, attn_weights = attn_output
+            x = x + attn_out
+        else:
+            x = x + attn_output
         
         x = x + self.mlp(x)   
         
-        x = self.final_norm(x)  
-        return x
+        x = self.final_norm(x)
+        
+        if return_attn:
+            return x, attn_weights
+        else:
+            return x
 
 # Finally, we assemble multiple Transformer blocks
 class TransformerModel(nn.Module):
@@ -437,7 +451,7 @@ class TransformerModel(nn.Module):
         # (d) Final "unembedding" layer to get logits
         self.lm_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tokens_seq):
+    def forward(self, tokens_seq, return_attn=False):
         # tokens_seq: (seq_len, batch)
         seq_len, batch_size = tokens_seq.shape
         
@@ -457,7 +471,11 @@ class TransformerModel(nn.Module):
         
         # Run through all Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            block_output = block(x, return_attn=return_attn)
+            if return_attn:
+                x, attn_weights = block_output
+            else:
+                x = block_output
         
         # Apply final normalization
         x = self.final_norm(x)
@@ -465,7 +483,10 @@ class TransformerModel(nn.Module):
         # Apply unembedding layer to get logits
         logits = self.lm_head(x) # (seq_len, batch, vocab_size)
         
-        return logits
+        if return_attn:
+            return logits, attn_weights
+        else:
+            return logits
 
 
 ################################################################################
@@ -861,6 +882,22 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+        
+        # Plot attention heatmap for transformer model (debugging)
+        if model_name == "transformer":
+            with torch.no_grad():
+                seq_tensor = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
+                logits, attn = model(seq_tensor, return_attn=True)
+                # Extract head 0, batch 0: attn shape is (B, nH, T, T)
+                attn_head0 = attn[0, 0].cpu().numpy()  # (seq_len, seq_len)
+                
+                # Debug: print attention statistics
+                print(f"[{model_name}] Attention stats - min: {attn_head0.min():.6f}, max: {attn_head0.max():.6f}, mean: {attn_head0.mean():.6f}")
+                print(f"[{model_name}] Attention shape: {attn_head0.shape}")
+                
+                from plots import plot_attention_heatmap
+                plot_attention_heatmap(attn_head0, save_path="attn.png")
+                print(f"[{model_name}] Attention heatmap saved to attn.png")
 
     from plots import plot_batch_losses, plot_epoch_losses
     plot_batch_losses(batch_losses, save_path="batch_loss.png")
