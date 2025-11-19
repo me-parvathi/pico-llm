@@ -56,6 +56,9 @@ def parse_args():
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
 
+    parser.add_argument("--plot_nucleus_debug", action="store_true",
+                        help="If set, plot nucleus sampling distribution during generation (for debugging).")
+
     args = parser.parse_args()
     return args
 
@@ -478,9 +481,14 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 # 7. Single code path for text generation
 ################################################################################
 
-def nucleus_sampling(logits, p=0.95):
+def nucleus_sampling(logits, p=0.95, plot_debug=False):
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_indices = torch.sort(probs, descending = True)
+    
+    if plot_debug:
+        from plots import plot_nucleus_distribution
+        plot_nucleus_distribution(sorted_probs, p, save_path="nucleus.png")
+    
     cumulative_sum_probs = torch.cumsum(sorted_probs, dim=-1)
     nucleus_mask = cumulative_sum_probs <= p 
 
@@ -505,7 +513,8 @@ def nucleus_sampling(logits, p=0.95):
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                   top_p=None,
                   monosemantic_info=None,
-                  do_monosemantic=False):
+                  do_monosemantic=False,
+                  plot_nucleus_debug=False):
     """
     A single code path for all models:
       - We keep a growing list 'context_tokens'.
@@ -529,7 +538,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                 # greedy
                 chosen_token = torch.argmax(next_logits).item()
             else:
-                chosen_token = nucleus_sampling(next_logits, p=top_p)
+                chosen_token = nucleus_sampling(next_logits, p=top_p, plot_debug=plot_nucleus_debug)
 
             context_tokens.append(chosen_token)
 
@@ -575,7 +584,9 @@ def train_one_model(model,
                     enc=None,
                     monosemantic_info=None,
                     prompt="Once upon a",
-                    batch_losses=None):
+                    batch_losses=None,
+                    epoch_losses=None,
+                    plot_nucleus_debug=False):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
@@ -628,7 +639,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=None,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Greedy Sample: {text_greedy}")
                     print(f" Annotated: {ann_greedy}\n")
@@ -638,7 +650,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=0.95,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Top-p (p=0.95) Sample: {text_topp}")
                     print(f" Annotated: {ann_topp}\n")
@@ -649,7 +662,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=1.0,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
@@ -662,6 +676,9 @@ def train_one_model(model,
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        
+        if epoch_losses is not None:
+            epoch_losses[model_name].append(avg_loss)
 
 
 ################################################################################
@@ -787,6 +804,7 @@ def main():
     }
 
     batch_losses = {model_name: [] for model_name in models}
+    epoch_losses = {model_name: [] for model_name in models}
 
     ############################################################################
     # Train each model
@@ -805,7 +823,9 @@ def main():
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
             prompt=args.prompt,  # <--- Pass the user-specified prompt here
-            batch_losses=batch_losses
+            batch_losses=batch_losses,
+            epoch_losses=epoch_losses,
+            plot_nucleus_debug=args.plot_nucleus_debug
         )
 
         # Final generation from the user-provided prompt (args.prompt).
@@ -814,16 +834,19 @@ def main():
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=None,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=0.95,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=1.0,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
 
         print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
@@ -839,8 +862,9 @@ def main():
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
 
-    from plots import plot_batch_losses
+    from plots import plot_batch_losses, plot_epoch_losses
     plot_batch_losses(batch_losses, save_path="batch_loss.png")
+    plot_epoch_losses(epoch_losses, save_path="epoch_loss.png")
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
