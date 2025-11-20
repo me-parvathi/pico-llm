@@ -23,7 +23,8 @@ from monosemantic_analysis import (
     compute_neuron_stats,
     top_k_tokens_for_neuron,
     visualize_neuron_distribution,
-    visualize_attention_weights
+    visualize_token_activation_heatmap,
+    plot_topk_tokens
 )
 
 # Import pico-llm module (handles hyphenated filename)
@@ -250,6 +251,8 @@ def parse_args():
                         help="Batch size for DataLoader (default: 16)")
     parser.add_argument("--device_id", type=str, default=None,
                         help="Torch device identifier (default: auto-detect)")
+    parser.add_argument("--positional_histograms", action="store_true",
+                        help="Generate histograms per token position instead of single histogram")
     return parser.parse_args()
 
 
@@ -399,14 +402,29 @@ def main():
                 k=20
             )
             print(f"    Top 20 tokens for Layer {layer}, Neuron {neuron}:")
-            for i, (token_str, activation_val, token_id, batch_idx, seq_pos) in enumerate(top_tokens[:10], 1):
-                print(f"      {i:2d}. '{token_str}' (activation: {activation_val:.4f}, token_id: {token_id})")
+            for i, token_data in enumerate(top_tokens[:10], 1):
+                if len(token_data) == 6:
+                    token_str, activation_val, token_id, batch_idx, batch_item, seq_pos = token_data
+                    print(f"      {i:2d}. '{token_str}' (activation: {activation_val:.4f}, token_id: {token_id}, batch={batch_idx}, seq={batch_item}, pos={seq_pos})")
+                else:
+                    # Backwards compatibility with old format
+                    token_str, activation_val, token_id, batch_idx, seq_pos = token_data[:5]
+                    print(f"      {i:2d}. '{token_str}' (activation: {activation_val:.4f}, token_id: {token_id})")
+            
+            # Plot top-k tokens
+            try:
+                topk_path = f"topk_tokens_l{layer}_n{neuron}.png"
+                plot_topk_tokens(layer, neuron, top_tokens, topk_path)
+                print(f"    Top-k tokens plot saved to {topk_path}")
+            except Exception as e:
+                print(f"    Error creating top-k tokens plot: {e}")
         except Exception as e:
             print(f"    Error getting top tokens: {e}")
         
         # Save histogram plot
         try:
-            fig = visualize_neuron_distribution(layer, neuron, loaded_activations)
+            fig = visualize_neuron_distribution(layer, neuron, loaded_activations, 
+                                                 by_position=args.positional_histograms)
             hist_path = f"neuron_l{layer}_n{neuron}_histogram.png"
             fig.savefig(hist_path)
             print(f"    Histogram saved to {hist_path}")
@@ -415,41 +433,18 @@ def main():
         except Exception as e:
             print(f"    Error creating histogram: {e}")
         
-        # Save attention heatmap for corresponding tokens
+        # Save token activation heatmap
         try:
-            # Get top token from this neuron
-            if top_tokens and len(top_tokens) > 0:
-                top_token_str, _, top_token_id, batch_idx, seq_pos = top_tokens[0]
-                
-                # Find a batch that contains this token and get attention weights
-                # We'll use the first batch that has activations for this layer
-                if len(loaded_activations["activations"]) > 0:
-                    batch_activations = loaded_activations["activations"][0]
-                    if layer < len(batch_activations["layers"]):
-                        attention_weights = batch_activations["layers"][layer]["attention"]
-                        # attention_weights shape: (batch, n_heads, seq_len, seq_len)
-                        
-                        # Get tokens for this batch to label the heatmap
-                        # We'll use a simple approach: get tokens from first sequence in batch
-                        if len(loaded_activations["token_ids"]) > 0:
-                            seq_tokens = loaded_activations["token_ids"][0]
-                            if isinstance(seq_tokens, torch.Tensor):
-                                token_list = seq_tokens.tolist()
-                            else:
-                                token_list = seq_tokens
-                            
-                            # Decode tokens for labels
-                            token_strings = [tokenizer.decode([tid]) for tid in token_list[:attention_weights.shape[-1]]]
-                            
-                            # Create attention heatmap
-                            fig = visualize_attention_weights(attention_weights, token_strings)
-                            attn_path = f"neuron_l{layer}_n{neuron}_attention.png"
-                            fig.savefig(attn_path)
-                            print(f"    Attention heatmap saved to {attn_path}")
-                            import matplotlib.pyplot as plt
-                            plt.close(fig)
+            fig = visualize_token_activation_heatmap(layer, neuron, loaded_activations)
+            heatmap_path = f"token_activation_heatmap_l{layer}_n{neuron}.png"
+            fig.savefig(heatmap_path)
+            print(f"    Token activation heatmap saved to {heatmap_path}")
+            import matplotlib.pyplot as plt
+            plt.close(fig)
         except Exception as e:
-            print(f"    Error creating attention heatmap: {e}")
+            print(f"    Error creating token activation heatmap: {e}")
+            import traceback
+            traceback.print_exc()
     
     print("\n" + "=" * 60)
     print("Interpretability pipeline completed successfully!")

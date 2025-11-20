@@ -411,19 +411,18 @@ class TransformerBlock(nn.Module):
         else:
             x = x + attn_output
         
-        # Collect pre-MLP activation if needed
-        mlp_pre = None
+        # Collect post-SiLU activation if needed
+        mlp_out = None
         if return_activations:
-            # Pre-MLP activation: after first Linear layer, before SiLU
-            # Note: matching actual code execution where self.mlp(x) is called directly
-            mlp_pre = self.mlp[0](x)  # (seq_len, batch, d_model * 4)
+            # Post-SiLU activation: after first Linear layer and SiLU
+            mlp_out = self.mlp[1](self.mlp[0](x))  # (seq_len, batch, d_model * 4)
         
         x = x + self.mlp(x)   
         
         x = self.final_norm(x)
         
         if return_activations:
-            return x, attn_weights, mlp_pre
+            return x, attn_weights, mlp_out
         elif return_attn:
             return x, attn_weights
         else:
@@ -490,10 +489,10 @@ class TransformerModel(nn.Module):
         for block in self.blocks:
             if return_activations:
                 block_output = block(x, return_attn=False, return_activations=True)
-                x, attn_weights, mlp_pre = block_output
+                x, attn_weights, mlp_out = block_output
                 activations["layers"].append({
                     "attention": attn_weights,
-                    "mlp_pre": mlp_pre
+                    "mlp_post": mlp_out
                 })
             elif return_attn:
                 block_output = block(x, return_attn=True, return_activations=False)
@@ -984,7 +983,7 @@ def main():
     
     # The list of normal Models to train and converge
     models = {
-        #"kgram_mlp_seq": kgram_model,
+        "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
         "transformer": transformer
     }
