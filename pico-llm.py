@@ -395,7 +395,7 @@ class TransformerBlock(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x, return_attn=False):
+    def forward(self, x, return_attn=False, return_activations=False):
         # x shape: (seq_len, batch, d_model)
         # We have used a Pre-Normalization architecture (like GPT-2 and Llama)
         
@@ -404,18 +404,27 @@ class TransformerBlock(nn.Module):
         # x = x + self.attn(self.norm1(x))
         # z = z + g(z)
         # x = x + self.mlp(self.norm2(x))
-        attn_output = self.attn(x, return_attn=return_attn)
-        if return_attn:
+        attn_output = self.attn(x, return_attn=(return_attn or return_activations))
+        if return_attn or return_activations:
             attn_out, attn_weights = attn_output
             x = x + attn_out
         else:
             x = x + attn_output
         
+        # Collect pre-MLP activation if needed
+        mlp_pre = None
+        if return_activations:
+            # Pre-MLP activation: after first Linear layer, before SiLU
+            # Note: matching actual code execution where self.mlp(x) is called directly
+            mlp_pre = self.mlp[0](x)  # (seq_len, batch, d_model * 4)
+        
         x = x + self.mlp(x)   
         
         x = self.final_norm(x)
         
-        if return_attn:
+        if return_activations:
+            return x, attn_weights, mlp_pre
+        elif return_attn:
             return x, attn_weights
         else:
             return x
@@ -451,7 +460,7 @@ class TransformerModel(nn.Module):
         # Final "unembedding" layer to get logits
         self.lm_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tokens_seq, return_attn=False):
+    def forward(self, tokens_seq, return_attn=False, return_activations=False):
         # tokens_seq: (seq_len, batch)
         seq_len, batch_size = tokens_seq.shape
         
@@ -469,13 +478,28 @@ class TransformerModel(nn.Module):
 
         x = tok_emb + pos_emb
         
+        # Initialize activations dict if needed
+        activations = None
+        if return_activations:
+            activations = {
+                "embeddings": tok_emb,
+                "layers": []
+            }
+        
         # Run through all Transformer blocks
         for block in self.blocks:
-            block_output = block(x, return_attn=return_attn)
-            if return_attn:
+            if return_activations:
+                block_output = block(x, return_attn=False, return_activations=True)
+                x, attn_weights, mlp_pre = block_output
+                activations["layers"].append({
+                    "attention": attn_weights,
+                    "mlp_pre": mlp_pre
+                })
+            elif return_attn:
+                block_output = block(x, return_attn=True, return_activations=False)
                 x, attn_weights = block_output
             else:
-                x = block_output
+                x = block(x, return_attn=False, return_activations=False)
         
         # Apply final normalization
         x = self.final_norm(x)
@@ -483,7 +507,9 @@ class TransformerModel(nn.Module):
         # Apply unembedding layer to get logits
         logits = self.lm_head(x) # (seq_len, batch, vocab_size)
         
-        if return_attn:
+        if return_activations:
+            return logits, activations
+        elif return_attn:
             return logits, attn_weights
         else:
             return logits
@@ -590,7 +616,23 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 
 
 ################################################################################
-# 8. Training
+# 8. Checkpointing
+################################################################################
+
+def save_checkpoint(model, optimizer, path):
+    torch.save({"model": model.state_dict(),
+                "optimizer": optimizer.state_dict()}, path)
+
+
+def load_checkpoint(model, optimizer, path):
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    return model, optimizer
+
+
+################################################################################
+# 9. Training
 ################################################################################
 from torch.optim.lr_scheduler import OneCycleLR
 
@@ -609,7 +651,9 @@ def train_one_model(model,
                     prompt="Once upon a",
                     batch_losses=None,
                     epoch_losses=None,
-                    plot_nucleus_debug=False):
+                    plot_nucleus_debug=False,
+                    checkpoint_dir="checkpoints",
+                    checkpoint_steps=50):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
@@ -718,11 +762,27 @@ def train_one_model(model,
                 print(f"[{model_name}] Reached max_steps_per_epoch={max_steps_per_epoch}, ending epoch {epoch} early.")
                 break
 
+            # Save checkpoint every N steps if specified
+            if checkpoint_dir is not None and checkpoint_steps is not None and global_step % checkpoint_steps == 0:
+                import os
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_step_{global_step}.pt")
+                save_checkpoint(model, optimizer, checkpoint_path)
+                print(f"[{model_name}] Saved checkpoint at step {global_step} to {checkpoint_path}")
+
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
         
         if epoch_losses is not None:
             epoch_losses[model_name].append(avg_loss)
+
+        # Save checkpoint after each epoch
+        if checkpoint_dir is not None:
+            import os
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch_{epoch}.pt")
+            save_checkpoint(model, optimizer, checkpoint_path)
+            print(f"[{model_name}] Saved checkpoint after epoch {epoch} to {checkpoint_path}")
 
 # This is used to overfit the model. It basically use uses 100 steps and works on a very small/single batch
 def train_overfit(model,
@@ -781,7 +841,7 @@ def train_overfit(model,
         print(f"[{model_name}] Overfit test complete. Final Loss: {loss.item():.6f} (Time: {total_time:.2f}s)")
         
 ################################################################################
-# 9. Main
+# 10. Main
 ################################################################################
 
 def main():
