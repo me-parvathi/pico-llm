@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # Some Command Line Arguments you can use
 # python -m venv .venv
 # python pico_llm.py --block_size 32 --tinystories_weight 0.0 --input_files 3seqs.txt --prompt "0 1 2 3 4" --device_id cuda:0
-# python pico_llm.py --block_size 32 --tinystories_weight 1.0 --input_files 3seqs.txt --prompt "Once upon a time" --device_id cuda:0
+# python pico_llm.py --block_size 32 --tinystories_weight 1.0 --prompt "Once upon a time" --device_id cuda:0
 
 from datasets import load_dataset
 import tiktoken
@@ -440,15 +440,15 @@ class TransformerModel(nn.Module):
         # We need a vector for each position from 0 to block_size-1
         self.pos_embedding = nn.Embedding(block_size, d_model)
         
-        # (c) A stack of Transformer Blocks
+        # A stack of Transformer Blocks
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads) for _ in range(n_blocks)]
         )
         
-        # (c) Final normalization (Llama-style)
+        # Final normalization (Llama-style)
         self.final_norm = RMSNorm(d_model)
         
-        # (d) Final "unembedding" layer to get logits
+        # Final "unembedding" layer to get logits
         self.lm_head = nn.Linear(d_model, vocab_size)
 
     def forward(self, tokens_seq, return_attn=False):
@@ -592,7 +592,9 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 ################################################################################
 # 8. Training
 ################################################################################
+from torch.optim.lr_scheduler import OneCycleLR
 
+# This function uses the 
 def train_one_model(model,
                     loader,
                     epochs,
@@ -611,11 +613,26 @@ def train_one_model(model,
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # AdamW is 'Adam with Weight Decay fixed'.
+    # weight_decay=0.1 or 0.01 are standard values.
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
 
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
+    
+    # Calculate steps per epoch correctly
+    if max_steps_per_epoch is not None:
+        steps_per_epoch = min(len(loader), max_steps_per_epoch)
+    else:
+        steps_per_epoch = len(loader)
+
+    total_steps = steps_per_epoch * epochs
+
+    # This is for the "Warmup" where the learning rate starts from 0, goes to the max which we set (3e-4) and then goes back down
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.1)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -638,7 +655,13 @@ def train_one_model(model,
 
             optimizer.zero_grad()
             loss.backward()
+
+            # Clips gradients to have a max norm of 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # Step the Optimizer and the Scheduler 
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             partial_loss += loss.item()
@@ -701,7 +724,62 @@ def train_one_model(model,
         if epoch_losses is not None:
             epoch_losses[model_name].append(avg_loss)
 
+# This is used to overfit the model. It basically use uses 100 steps and works on a very small/single batch
+def train_overfit(model,
+                  loader,
+                  steps=100,
+                  model_name="overfit",
+                  batch_losses=None,
+                  device="cpu",
+                  lr=3e-4):
+        """
+        Overfit function: Grabs a SINGLE batch from the loader and trains on it repeatedly.
+        If the model architecture is correct, loss should drop to near 0.0.
+        """
+        print(f"\n[{model_name}] Starting OVERFIT test on device: {device}")
+        
+        # 1. Setup Optimizer
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        model.train()
 
+        # 2. Grab ONE single batch
+        try:
+            first_batch = next(iter(loader))
+        except StopIteration:
+            print(f"[{model_name}] Error: Loader is empty!")
+            return
+
+        # Move to device ONCE
+        # batch_tokens shape: (seq_len, batch_size)
+        batch_tokens = first_batch.to(device)
+        
+        print(f"[{model_name}] Overfitting on a single batch of shape: {batch_tokens.shape}")
+        
+        start_time = time.time()
+
+        # 3. The Overfit Loop
+        for step in range(1, steps + 1):
+            # A. Forward Pass
+            logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
+            
+            # B. Compute Loss
+            # Note: compute_next_token_loss handles the shifting internally
+            loss = compute_next_token_loss(logits, batch_tokens)
+
+            # C. Backward Pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # D. Logging (Every 10 steps)
+            if step % 10 == 0 or step == 1:
+                print(f"[{model_name}] Step {step}/{steps} | Loss: {loss.item():.6f}")
+                if batch_losses is not None:
+                    batch_losses[model_name].append(loss.item())
+
+        total_time = time.time() - start_time
+        print(f"[{model_name}] Overfit test complete. Final Loss: {loss.item():.6f} (Time: {total_time:.2f}s)")
+        
 ################################################################################
 # 9. Main
 ################################################################################
@@ -716,7 +794,7 @@ def main():
     embed_size = args.embed_size
     batch_size = 16
     num_epochs = 3
-    learning_rate = 1e-3
+    learning_rate = 3e-4
 
     block_size = args.block_size
     train_subset_size = 20000
@@ -789,6 +867,7 @@ def main():
         p_tiny=p_tiny
     )
 
+    # This part uses the collation function, and merges datasets as you want
     train_loader = torch.utils.data.DataLoader(
         combined_dataset,
         batch_size=batch_size,
@@ -800,6 +879,7 @@ def main():
     ############################################################################
     # Models
     ############################################################################
+    # K-Gram, won't really be used, but added to showcase how One Hot Encofding is a computational disaster
     kgram_model = KGramMLPSeqModel(
         vocab_size=vocab_size,
         k=k,
@@ -808,28 +888,59 @@ def main():
         chunk_size=chunk_size
     ).to(device)
 
+    # LSTM, serves as a baseline Sanity Check
     lstm_model = LSTMSeqModel(
         vocab_size=vocab_size,
         embed_size=embed_size,
         hidden_size=embed_size
     ).to(device)
 
+    # A baseline Transformer Architecture, serves as the benchmark, if you get it to converge lol 
+    # In your main script or config
     transformer = TransformerModel(
+        vocab_size=50257,
+        d_model=768,
+        n_heads=12,
+        n_blocks=6,
+        block_size=64
     ).to(device)
 
+    # The list of normal Models to overfit
+    overfit_models = {
+        #"kgram_mlp_seq_overfit": kgram_model,
+        "lstm_seq_overfit": lstm_model,
+        "transformer_overfit": transformer
+    }
+    
+    # The list of normal Models to train and converge
     models = {
-    #   "kgram_mlp_seq": kgram_model,
-      "lstm_seq": lstm_model,
-       "transformer": transformer
-    #   "kvcache_transformer": kv_transformer,
+        #"kgram_mlp_seq": kgram_model,
+        "lstm_seq": lstm_model,
+        "transformer": transformer
     }
 
+    # The Dictionaries that you can use to Plot the Losses in plots.py 
     batch_losses = {model_name: [] for model_name in models}
+    overfit_batch_losses = {model_name: [] for model_name in overfit_models}
     epoch_losses = {model_name: [] for model_name in models}
 
     ############################################################################
     # Train each model
     ############################################################################
+
+    # Train all the Models and check whether they appropriately overfit
+    for model_name, model in overfit_models.items():
+        print(f"\n=== Overfitting model: {model_name} ===")
+        train_overfit(
+            model=model, 
+            loader=train_loader, 
+            steps=100, 
+            model_name=model_name,
+            batch_losses=overfit_batch_losses,
+            device=device
+        )
+
+    # Train all the Models and check whether they converge appropriately
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
         train_one_model(
@@ -898,8 +1009,11 @@ def main():
                 from plots import plot_attention_heatmap
                 plot_attention_heatmap(attn_head0, save_path="attn.png")
                 print(f"[{model_name}] Attention heatmap saved to attn.png")
+    
 
+    # Plot all the Models, including the Overfit ones. The Epoch Loss tells us a bigger picture
     from plots import plot_batch_losses, plot_epoch_losses
+    plot_batch_losses(overfit_batch_losses, save_path="overfit_batch_loss.png")
     plot_batch_losses(batch_losses, save_path="batch_loss.png")
     plot_epoch_losses(epoch_losses, save_path="epoch_loss.png")
 
