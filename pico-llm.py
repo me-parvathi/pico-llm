@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # Some Command Line Arguments you can use
 # python -m venv .venv
 # python pico_llm.py --block_size 32 --tinystories_weight 0.0 --input_files 3seqs.txt --prompt "0 1 2 3 4" --device_id cuda:0
-# python pico_llm.py --block_size 32 --tinystories_weight 1.0 --input_files 3seqs.txt --prompt "Once upon a time" --device_id cuda:0
+# python pico_llm.py --block_size 32 --tinystories_weight 1.0 --prompt "Once upon a time" --device_id cuda:0
 
 from datasets import load_dataset
 import tiktoken
@@ -55,6 +55,9 @@ def parse_args():
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
+
+    parser.add_argument("--plot_nucleus_debug", action="store_true",
+                        help="If set, plot nucleus sampling distribution during generation (for debugging).")
 
     args = parser.parse_args()
     return args
@@ -329,7 +332,7 @@ class MultiHeadAttention(nn.Module):
         # Final output projection
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         # Input
         seq_len, batch_size, d_model = x.shape
         
@@ -361,7 +364,12 @@ class MultiHeadAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         context = context.transpose(0, 1)
 
-        return self.out_proj(context)
+        output = self.out_proj(context)
+        
+        if return_attn:
+            return output, attn_weights
+        else:
+            return output
 
 # Following is a single Transformer Head, which we will combine as a "block" in the main model
 class TransformerBlock(nn.Module):
@@ -385,18 +393,32 @@ class TransformerBlock(nn.Module):
             nn.SiLU(), # Choice: Use ReLU vs Swish like a choice variable
             nn.Linear(d_model * 4, d_model)
         )
+        self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         # x shape: (seq_len, batch, d_model)
         # We have used a Pre-Normalization architecture (like GPT-2 and Llama)
         
         # Attention Sub-layer, which also has the residual connection
         # (x = x + Sum(f(x_j)))
-        x = x + self.attn(self.norm1(x))
+        # x = x + self.attn(self.norm1(x))
         # z = z + g(z)
-        x = x + self.mlp(self.norm2(x))
+        # x = x + self.mlp(self.norm2(x))
+        attn_output = self.attn(x, return_attn=return_attn)
+        if return_attn:
+            attn_out, attn_weights = attn_output
+            x = x + attn_out
+        else:
+            x = x + attn_output
         
-        return x
+        x = x + self.mlp(x)   
+        
+        x = self.final_norm(x)
+        
+        if return_attn:
+            return x, attn_weights
+        else:
+            return x
 
 # Finally, we assemble multiple Transformer blocks
 class TransformerModel(nn.Module):
@@ -418,18 +440,18 @@ class TransformerModel(nn.Module):
         # We need a vector for each position from 0 to block_size-1
         self.pos_embedding = nn.Embedding(block_size, d_model)
         
-        # (c) A stack of Transformer Blocks
+        # A stack of Transformer Blocks
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads) for _ in range(n_blocks)]
         )
         
-        # (c) Final normalization (Llama-style)
+        # Final normalization (Llama-style)
         self.final_norm = RMSNorm(d_model)
         
-        # (d) Final "unembedding" layer to get logits
+        # Final "unembedding" layer to get logits
         self.lm_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tokens_seq):
+    def forward(self, tokens_seq, return_attn=False):
         # tokens_seq: (seq_len, batch)
         seq_len, batch_size = tokens_seq.shape
         
@@ -449,7 +471,11 @@ class TransformerModel(nn.Module):
         
         # Run through all Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            block_output = block(x, return_attn=return_attn)
+            if return_attn:
+                x, attn_weights = block_output
+            else:
+                x = block_output
         
         # Apply final normalization
         x = self.final_norm(x)
@@ -457,7 +483,10 @@ class TransformerModel(nn.Module):
         # Apply unembedding layer to get logits
         logits = self.lm_head(x) # (seq_len, batch, vocab_size)
         
-        return logits
+        if return_attn:
+            return logits, attn_weights
+        else:
+            return logits
 
 
 ################################################################################
@@ -473,9 +502,14 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 # 7. Single code path for text generation
 ################################################################################
 
-def nucleus_sampling(logits, p=0.95):
+def nucleus_sampling(logits, p=0.95, plot_debug=False):
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_indices = torch.sort(probs, descending = True)
+    
+    if plot_debug:
+        from plots import plot_nucleus_distribution
+        plot_nucleus_distribution(sorted_probs, p, save_path="nucleus.png")
+    
     cumulative_sum_probs = torch.cumsum(sorted_probs, dim=-1)
     nucleus_mask = cumulative_sum_probs <= p 
 
@@ -500,7 +534,8 @@ def nucleus_sampling(logits, p=0.95):
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                   top_p=None,
                   monosemantic_info=None,
-                  do_monosemantic=False):
+                  do_monosemantic=False,
+                  plot_nucleus_debug=False):
     """
     A single code path for all models:
       - We keep a growing list 'context_tokens'.
@@ -524,7 +559,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                 # greedy
                 chosen_token = torch.argmax(next_logits).item()
             else:
-                chosen_token = nucleus_sampling(next_logits, p=top_p)
+                chosen_token = nucleus_sampling(next_logits, p=top_p, plot_debug=plot_nucleus_debug)
 
             context_tokens.append(chosen_token)
 
@@ -557,7 +592,9 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 ################################################################################
 # 8. Training
 ################################################################################
+from torch.optim.lr_scheduler import OneCycleLR
 
+# This function uses the 
 def train_one_model(model,
                     loader,
                     epochs,
@@ -569,15 +606,33 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    batch_losses=None,
+                    epoch_losses=None,
+                    plot_nucleus_debug=False):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # AdamW is 'Adam with Weight Decay fixed'.
+    # weight_decay=0.1 or 0.01 are standard values.
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
 
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
+    
+    # Calculate steps per epoch correctly
+    if max_steps_per_epoch is not None:
+        steps_per_epoch = min(len(loader), max_steps_per_epoch)
+    else:
+        steps_per_epoch = len(loader)
+
+    total_steps = steps_per_epoch * epochs
+
+    # This is for the "Warmup" where the learning rate starts from 0, goes to the max which we set (3e-4) and then goes back down
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.1)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -595,9 +650,18 @@ def train_one_model(model,
             logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
             loss = compute_next_token_loss(logits, batch_tokens)
 
+            if batch_losses is not None:
+                batch_losses[model_name].append(loss.item())
+
             optimizer.zero_grad()
             loss.backward()
+
+            # Clips gradients to have a max norm of 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # Step the Optimizer and the Scheduler 
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             partial_loss += loss.item()
@@ -619,7 +683,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=None,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Greedy Sample: {text_greedy}")
                     print(f" Annotated: {ann_greedy}\n")
@@ -629,7 +694,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=0.95,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Top-p (p=0.95) Sample: {text_topp}")
                     print(f" Annotated: {ann_topp}\n")
@@ -640,7 +706,8 @@ def train_one_model(model,
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=1.0,
                         monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
+                        do_monosemantic=(monosemantic_info is not None),
+                        plot_nucleus_debug=plot_nucleus_debug
                     )
                     print(f" Top-p (p=1.0) Sample: {text_topp1}")
                     print(f" Annotated: {ann_topp1}\n")
@@ -653,8 +720,66 @@ def train_one_model(model,
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        
+        if epoch_losses is not None:
+            epoch_losses[model_name].append(avg_loss)
 
+# This is used to overfit the model. It basically use uses 100 steps and works on a very small/single batch
+def train_overfit(model,
+                  loader,
+                  steps=100,
+                  model_name="overfit",
+                  batch_losses=None,
+                  device="cpu",
+                  lr=3e-4):
+        """
+        Overfit function: Grabs a SINGLE batch from the loader and trains on it repeatedly.
+        If the model architecture is correct, loss should drop to near 0.0.
+        """
+        print(f"\n[{model_name}] Starting OVERFIT test on device: {device}")
+        
+        # 1. Setup Optimizer
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        model.train()
 
+        # 2. Grab ONE single batch
+        try:
+            first_batch = next(iter(loader))
+        except StopIteration:
+            print(f"[{model_name}] Error: Loader is empty!")
+            return
+
+        # Move to device ONCE
+        # batch_tokens shape: (seq_len, batch_size)
+        batch_tokens = first_batch.to(device)
+        
+        print(f"[{model_name}] Overfitting on a single batch of shape: {batch_tokens.shape}")
+        
+        start_time = time.time()
+
+        # 3. The Overfit Loop
+        for step in range(1, steps + 1):
+            # A. Forward Pass
+            logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
+            
+            # B. Compute Loss
+            # Note: compute_next_token_loss handles the shifting internally
+            loss = compute_next_token_loss(logits, batch_tokens)
+
+            # C. Backward Pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # D. Logging (Every 10 steps)
+            if step % 10 == 0 or step == 1:
+                print(f"[{model_name}] Step {step}/{steps} | Loss: {loss.item():.6f}")
+                if batch_losses is not None:
+                    batch_losses[model_name].append(loss.item())
+
+        total_time = time.time() - start_time
+        print(f"[{model_name}] Overfit test complete. Final Loss: {loss.item():.6f} (Time: {total_time:.2f}s)")
+        
 ################################################################################
 # 9. Main
 ################################################################################
@@ -669,7 +794,7 @@ def main():
     embed_size = args.embed_size
     batch_size = 16
     num_epochs = 3
-    learning_rate = 1e-3
+    learning_rate = 3e-4
 
     block_size = args.block_size
     train_subset_size = 20000
@@ -742,6 +867,7 @@ def main():
         p_tiny=p_tiny
     )
 
+    # This part uses the collation function, and merges datasets as you want
     train_loader = torch.utils.data.DataLoader(
         combined_dataset,
         batch_size=batch_size,
@@ -753,6 +879,7 @@ def main():
     ############################################################################
     # Models
     ############################################################################
+    # K-Gram, won't really be used, but added to showcase how One Hot Encofding is a computational disaster
     kgram_model = KGramMLPSeqModel(
         vocab_size=vocab_size,
         k=k,
@@ -761,25 +888,59 @@ def main():
         chunk_size=chunk_size
     ).to(device)
 
+    # LSTM, serves as a baseline Sanity Check
     lstm_model = LSTMSeqModel(
         vocab_size=vocab_size,
         embed_size=embed_size,
         hidden_size=embed_size
     ).to(device)
 
+    # A baseline Transformer Architecture, serves as the benchmark, if you get it to converge lol 
+    # In your main script or config
     transformer = TransformerModel(
+        vocab_size=50257,
+        d_model=768,
+        n_heads=12,
+        n_blocks=6,
+        block_size=64
     ).to(device)
 
+    # The list of normal Models to overfit
+    overfit_models = {
+        #"kgram_mlp_seq_overfit": kgram_model,
+        "lstm_seq_overfit": lstm_model,
+        "transformer_overfit": transformer
+    }
+    
+    # The list of normal Models to train and converge
     models = {
-      # "kgram_mlp_seq": kgram_model,
+        #"kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
-      # "kvcache_transformer": kv_transformer,
+        "transformer": transformer
     }
 
+    # The Dictionaries that you can use to Plot the Losses in plots.py 
+    batch_losses = {model_name: [] for model_name in models}
+    overfit_batch_losses = {model_name: [] for model_name in overfit_models}
+    epoch_losses = {model_name: [] for model_name in models}
 
     ############################################################################
     # Train each model
     ############################################################################
+
+    # Train all the Models and check whether they appropriately overfit
+    for model_name, model in overfit_models.items():
+        print(f"\n=== Overfitting model: {model_name} ===")
+        train_overfit(
+            model=model, 
+            loader=train_loader, 
+            steps=100, 
+            model_name=model_name,
+            batch_losses=overfit_batch_losses,
+            device=device
+        )
+
+    # Train all the Models and check whether they converge appropriately
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
         train_one_model(
@@ -793,7 +954,10 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            batch_losses=batch_losses,
+            epoch_losses=epoch_losses,
+            plot_nucleus_debug=args.plot_nucleus_debug
         )
 
         # Final generation from the user-provided prompt (args.prompt).
@@ -802,16 +966,19 @@ def main():
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=None,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=0.95,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=1.0,
+                plot_nucleus_debug=args.plot_nucleus_debug
             )
 
         print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
@@ -826,6 +993,29 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+        
+        # Plot attention heatmap for transformer model (debugging)
+        if model_name == "transformer":
+            with torch.no_grad():
+                seq_tensor = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
+                logits, attn = model(seq_tensor, return_attn=True)
+                # Extract head 0, batch 0: attn shape is (B, nH, T, T)
+                attn_head0 = attn[0, 0].cpu().numpy()  # (seq_len, seq_len)
+                
+                # Debug: print attention statistics
+                print(f"[{model_name}] Attention stats - min: {attn_head0.min():.6f}, max: {attn_head0.max():.6f}, mean: {attn_head0.mean():.6f}")
+                print(f"[{model_name}] Attention shape: {attn_head0.shape}")
+                
+                from plots import plot_attention_heatmap
+                plot_attention_heatmap(attn_head0, save_path="attn.png")
+                print(f"[{model_name}] Attention heatmap saved to attn.png")
+    
+
+    # Plot all the Models, including the Overfit ones. The Epoch Loss tells us a bigger picture
+    from plots import plot_batch_losses, plot_epoch_losses
+    plot_batch_losses(overfit_batch_losses, save_path="overfit_batch_loss.png")
+    plot_batch_losses(batch_losses, save_path="batch_loss.png")
+    plot_epoch_losses(epoch_losses, save_path="epoch_loss.png")
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
