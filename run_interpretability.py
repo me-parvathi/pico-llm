@@ -52,14 +52,26 @@ def load_model(checkpoint_path, device="cpu"):
     Returns:
         Loaded TransformerModel
     """
-    # Model architecture parameters (matching pico-llm.py)
-    vocab_size = 50257
-    d_model = 768
-    n_heads = 12
-    n_blocks = 6
-    block_size = 64
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Create model with same architecture
+    # Extract config from checkpoint if available, otherwise use defaults
+    if isinstance(checkpoint, dict) and 'config' in checkpoint:
+        config = checkpoint['config']
+        vocab_size = config.get('vocab_size', 50257)
+        d_model = config.get('d_model', 768)
+        n_heads = config.get('n_heads', 12)
+        n_blocks = config.get('n_blocks', 6)
+        block_size = config.get('block_size', 64)
+    else:
+        # Defaults (for old checkpoints without config)
+        vocab_size = 50257
+        d_model = 768
+        n_heads = 12
+        n_blocks = 6
+        block_size = 64
+    
+    # Create model with architecture from config
     model = TransformerModel(
         vocab_size=vocab_size,
         d_model=d_model,
@@ -68,12 +80,8 @@ def load_model(checkpoint_path, device="cpu"):
         block_size=block_size
     )
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
     # Handle different checkpoint formats
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
-        # Format from pico-llm.py: {"model": model.state_dict(), "optimizer": ...}
         model.load_state_dict(checkpoint['model'])
     elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         model.load_state_dict(checkpoint['state_dict'])

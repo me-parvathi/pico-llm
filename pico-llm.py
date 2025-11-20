@@ -620,8 +620,18 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
 ################################################################################
 
 def save_checkpoint(model, optimizer, path):
-    torch.save({"model": model.state_dict(),
-                "optimizer": optimizer.state_dict()}, path)
+    checkpoint = {"model": model.state_dict(),
+                  "optimizer": optimizer.state_dict()}
+    # Save model config if it's a TransformerModel
+    if hasattr(model, 'vocab_size') and hasattr(model, 'd_model'):
+        checkpoint["config"] = {
+            "vocab_size": model.vocab_size,
+            "d_model": model.d_model,
+            "n_heads": model.n_heads,
+            "n_blocks": model.n_blocks,
+            "block_size": model.block_size
+        }
+    torch.save(checkpoint, path)
 
 
 def load_checkpoint(model, optimizer, path):
