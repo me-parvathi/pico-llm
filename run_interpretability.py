@@ -364,11 +364,18 @@ def main():
     # Select a few interesting neurons to analyze
     # We'll pick neurons from different layers
     selected_neurons = [
-        (0, 0),   # Layer 0, Neuron 0
-        (0, 100), # Layer 0, Neuron 100
-        (2, 0),   # Layer 2, Neuron 0
-        (2, 500), # Layer 2, Neuron 500
-    ]
+    # Layer 0 (early processing)
+    (0, 0), (0, 256), (0, 512), (0, 1024), (0, 2048),
+    
+    # Layer 2 (middle processing)
+    (2, 0), (2, 512), (2, 1024), (2, 1536), (2, 2500),
+    
+    # Layer 4 (late processing)
+    (4, 0), (4, 768), (4, 1536), (4, 2304), (4, 3000),
+    
+    # Layer 5 (final layer - most semantic)
+    (5, 0), (5, 500), (5, 1500), (5, 2500), (5, 3071),
+]
     
     # Filter to only valid neurons
     valid_neurons = []
