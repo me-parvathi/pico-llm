@@ -1066,18 +1066,46 @@ def main():
         # Plot attention heatmap for transformer model (debugging)
         if model_name == "transformer":
             with torch.no_grad():
-                seq_tensor = torch.tensor(enc.encode(args.prompt), dtype=torch.long, device=device).unsqueeze(1)
+                prompt_tokens = enc.encode(args.prompt)
+                seq_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(1)
                 logits, attn = model(seq_tensor, return_attn=True)
-                # Extract head 0, batch 0: attn shape is (B, nH, T, T)
-                attn_head0 = attn[0, 0].cpu().numpy()  # (seq_len, seq_len)
+                
+                # attn shape is (B, nH, T, T)
+                batch_idx = 0
+                attn_all_heads = attn[batch_idx].cpu().numpy()  # (n_heads, seq_len, seq_len)
+                attn_head0 = attn_all_heads[0]  # (seq_len, seq_len)
+                
+                # Decode tokens for labeling
+                tokens = [enc.decode([token_id]) for token_id in prompt_tokens]
                 
                 # Debug: print attention statistics
                 print(f"[{model_name}] Attention stats - min: {attn_head0.min():.6f}, max: {attn_head0.max():.6f}, mean: {attn_head0.mean():.6f}")
                 print(f"[{model_name}] Attention shape: {attn_head0.shape}")
+                print(f"[{model_name}] Number of heads: {attn_all_heads.shape[0]}")
                 
-                from plots import plot_attention_heatmap
-                plot_attention_heatmap(attn_head0, save_path="attn.png")
-                print(f"[{model_name}] Attention heatmap saved to attn.png")
+                # Import all new visualization functions
+                from plots import (plot_attention_heatmap, plot_multihead_attention,
+                                  plot_attention_comparison, plot_attention_flow)
+                
+                # 1. Single head heatmap (original, improved)
+                plot_attention_heatmap(attn_head0, save_path="attn_head0.png")
+                
+                # 2. All heads in grid
+                plot_multihead_attention(attn_all_heads, save_path="attn_all_heads.png")
+                
+                # 3. Statistical comparison across heads
+                plot_attention_comparison(attn_all_heads, tokens=tokens, 
+                                         save_path="attn_comparison.png")
+                
+                # 4. Attention flow diagram for head 0
+                plot_attention_flow(attn_head0, tokens=tokens, threshold=0.1,
+                                   save_path="attn_flow_head0.png")
+                
+                print(f"[{model_name}] Attention visualizations saved!")
+                print(f"  - attn_head0.png (single head heatmap)")
+                print(f"  - attn_all_heads.png (all {attn_all_heads.shape[0]} heads)")
+                print(f"  - attn_comparison.png (mean/std/max analysis)")
+                print(f"  - attn_flow_head0.png (attention flow diagram)")
     
 
     # Plot all the Models, including the Overfit ones. The Epoch Loss tells us a bigger picture
